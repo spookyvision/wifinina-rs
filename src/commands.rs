@@ -2,14 +2,17 @@ pub mod network;
 pub mod socket;
 pub mod wifi;
 
-use embedded_hal::digital::v2::{InputPin, OutputPin};
-use embedded_hal::spi::FullDuplex;
+use core::fmt::Debug;
 
-use crate::util::millis::{Milliseconds, U32Ext};
-use crate::util::spi_ext::SpiExt;
-use crate::util::timeout_iter::IntoTimeoutIter;
+use embedded_hal::{
+    digital::v2::{InputPin, OutputPin},
+    spi::FullDuplex,
+};
+use nb::block;
 
-use crate::{Error, WifiNina};
+use crate::{util::spi_ext::SpiExt, Error, WifiNina};
+
+use self::socket::InvalidSocket;
 
 #[derive(Debug, Copy, Clone)]
 #[repr(u8)]
@@ -34,6 +37,7 @@ pub enum NinaCommand {
     GetCurrentRssi = 0x25,
     GetCurrentEnct = 0x26,
     ScanNetworks = 0x27,
+    StartServerTcp = 0x28,
 
     GetSocket = 0x3F,
     GetStateTcp = 0x29,
@@ -92,27 +96,22 @@ impl Into<u8> for NinaResponse {
     }
 }
 
-impl<CsPin, BusyPin, Spi, SpiError, CountDown, CountDownTime>
-    WifiNina<CsPin, BusyPin, Spi, CountDown>
+impl<CsPin, BusyPin, Spi, SpiError, Delay> WifiNina<CsPin, BusyPin, Spi, Delay>
 where
     BusyPin: InputPin,
     CsPin: OutputPin,
-    Spi: FullDuplex<u8, Error = SpiError>
-        + embedded_hal::blocking::spi::Write<u8, Error = SpiError>
-        + embedded_hal::blocking::spi::WriteIter<u8, Error = SpiError>,
-    CountDown: embedded_hal::timer::CountDown<Time = CountDownTime>,
-    CountDownTime: From<Milliseconds>,
+    Spi:
+        FullDuplex<u8, Error = SpiError> + embedded_hal::blocking::spi::Write<u8, Error = SpiError>,
+    SpiError: Debug,
+    //+ embedded_hal::blocking::spi::WriteIter<u8, Error = SpiError>,
+    Delay: embedded_hal::blocking::delay::DelayMs<u16>,
 {
     const REPLY_FLAG: u8 = 1 << 7;
 
     // Static method because it needs to be called while chip_select is mutably
     // borrowed
-    fn wait_for_response_start<C, CT>(spi: &mut Spi, timer: &mut C) -> Result<(), Error<SpiError>>
-    where
-        C: embedded_hal::timer::CountDown<Time = CT>,
-        CT: From<Milliseconds>,
-    {
-        for _ in timer.timeout_iter(100.ms()) {
+    fn wait_for_response_start(spi: &mut Spi, delay: &mut Delay) -> Result<(), Error<SpiError>> {
+        for attempt in 0..100 {
             let byte = spi.transfer_byte().map_err(Error::spi)?;
 
             if byte == NinaCommand::Start.into() {
@@ -120,7 +119,18 @@ where
             } else if byte == NinaCommand::Error.into() {
                 return Err(Error::ErrorResponse);
             }
+            delay.delay_ms(1);
         }
+
+        // for _ in timer.timeout_iter(100.ms()) {
+        //     let byte = spi.transfer_byte().map_err(Error::spi)?;
+
+        //     if byte == NinaCommand::Start.into() {
+        //         return Ok(());
+        //     } else if byte == NinaCommand::Error.into() {
+        //         return Err(Error::ErrorResponse);
+        //     }
+        // }
 
         Err(Error::ResponseTimeout)
     }
@@ -135,13 +145,17 @@ where
         }
     }
 
+    pub fn wait_for_busy(&mut self) -> Result<(), Error<SpiError>> {
+        let mut spi = self.chip_select.select(&mut self.spi, &mut self.delay)?;
+        Ok(())
+    }
+
     fn send_command(
         &mut self,
-        spi: &mut Spi,
         cmd: NinaCommand,
         params: Params<SendParam>,
     ) -> Result<(), Error<SpiError>> {
-        let mut spi = self.chip_select.select(spi, &mut self.timer)?;
+        let mut spi = self.chip_select.select(&mut self.spi, &mut self.delay)?;
 
         let cmd_byte: u8 = cmd.into();
         let mut sent_len: usize = 0;
@@ -172,25 +186,32 @@ where
             Ok(())
         };
 
-        let write_bytes = |spi: &mut Spi, bytes: &mut dyn Iterator<Item = u8>| {
-            spi.write_iter(bytes).map_err(Error::spi)
-        };
+        let write_bytes: fn(&mut Spi, &mut dyn Iterator<Item = u8>) -> Result<(), Error<SpiError>> =
+            |spi: &mut Spi, bytes: &mut dyn Iterator<Item = u8>| {
+                for word in bytes.into_iter() {
+                    block!(spi.send(word.clone())).map_err(Error::spi)?;
+                    block!(spi.read()).map_err(Error::spi)?;
+                }
+
+                Ok(())
+                //spi.write_iter(bytes).map_err(Error::spi)
+            };
 
         for p in params {
             match p {
                 SendParam::Byte(b) => {
                     write_len(&mut spi, 1)?;
-                    write_bytes(&mut spi, &mut [*b].into_iter().cloned())?;
+                    write_bytes(&mut spi, &mut [*b].iter().cloned())?;
                 }
 
                 SendParam::Word(w) => {
                     write_len(&mut spi, 2)?;
-                    write_bytes(&mut spi, &mut w.to_be_bytes().into_iter().cloned())?;
+                    write_bytes(&mut spi, &mut w.to_be_bytes().iter().cloned())?;
                 }
 
                 SendParam::LEWord(w) => {
                     write_len(&mut spi, 2)?;
-                    write_bytes(&mut spi, &mut w.to_le_bytes().into_iter().cloned())?;
+                    write_bytes(&mut spi, &mut w.to_le_bytes().iter().cloned())?;
                 }
 
                 SendParam::Bytes(it) => {
@@ -215,14 +236,13 @@ where
 
     fn receive_response(
         &mut self,
-        spi: &mut Spi,
         cmd: NinaCommand,
         params: Params<RecvParam>,
     ) -> Result<(), Error<SpiError>> {
-        let mut spi = self.chip_select.select(spi, &mut self.timer)?;
+        let mut spi = self.chip_select.select(&mut self.spi, &mut self.delay)?;
 
         let cmd_byte: u8 = cmd.into();
-        Self::wait_for_response_start(&mut spi, &mut self.timer)?;
+        Self::wait_for_response_start(&mut spi, &mut self.delay)?;
         // We expect that the server sends back the same command, with the high bit
         // set to indicate a reply.
         Self::expect_byte(&mut spi, Self::REPLY_FLAG | cmd_byte)?;
@@ -321,6 +341,11 @@ where
                         arr[i] = spi.transfer_byte().map_err(Error::spi)?;
                     }
                 }
+
+                RecvParam::Socket(ref mut socket) => {
+                    read_len(&mut spi, Some(1))?;
+                    *socket.num_mut() = spi.transfer_byte().map_err(Error::spi)?;
+                }
             };
 
             param_idx += 1;
@@ -335,18 +360,16 @@ where
 
     fn send_and_receive(
         &mut self,
-        spi: &mut Spi,
         command: NinaCommand,
         send_params: Params<SendParam>,
         recv_params: Params<RecvParam>,
     ) -> Result<(), Error<SpiError>> {
-        self.send_command(spi, command, send_params)?;
-        self.receive_response(spi, command, recv_params)
+        self.send_command(command, send_params)?;
+        self.receive_response(command, recv_params)
     }
 
-    pub fn set_debug(&mut self, spi: &mut Spi, enabled: bool) -> Result<(), Error<SpiError>> {
+    pub fn set_debug(&mut self, enabled: bool) -> Result<(), Error<SpiError>> {
         self.send_and_receive(
-            spi,
             NinaCommand::SetDebug,
             Params::of(&mut [SendParam::Byte(enabled as u8)]),
             Params::of(&mut [RecvParam::Ack]),
@@ -365,6 +388,7 @@ pub enum SendParam<'a> {
 pub enum RecvParam<'a> {
     Ack,
     Byte(&'a mut u8),
+    Socket(&'a mut InvalidSocket),
     OptionalByte(&'a mut Option<u8>),
     ExpectByte(u8),
     Word(&'a mut u16),

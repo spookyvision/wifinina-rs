@@ -1,61 +1,47 @@
+use core::{
+    convert::TryInto,
+    fmt::{Display, Write},
+};
+
+use embedded_hal::{
+    digital::v2::{InputPin, OutputPin},
+    spi::FullDuplex,
+};
 #[cfg(feature = "genio-traits")]
 use genio;
+use nb;
+use numtoa::NumToA;
 #[cfg(feature = "genio-traits")]
 use void;
 
-use nb;
+use crate::{commands::*, Error, WifiNina};
 
-use embedded_hal::digital::v2::{InputPin, OutputPin};
-use embedded_hal::spi::FullDuplex;
-use embedded_hal::timer::CountDown;
-
-use crate::util::millis::{Milliseconds, U32Ext};
-use crate::{Error, WifiNina};
-use crate::commands::*;
-
-impl<CsPin, BusyPin, Spi, SpiError, CountDown, CountDownTime>
-    WifiNina<CsPin, BusyPin, Spi, CountDown>
+impl<CsPin, BusyPin, Spi, SpiError, Delay> WifiNina<CsPin, BusyPin, Spi, Delay>
 where
     BusyPin: InputPin,
     CsPin: OutputPin,
-    Spi: FullDuplex<u8, Error = SpiError>
-        + embedded_hal::blocking::spi::Write<u8, Error = SpiError>
-        + embedded_hal::blocking::spi::WriteIter<u8, Error = SpiError>,
-    CountDown: embedded_hal::timer::CountDown<Time = CountDownTime>,
-    CountDownTime: From<Milliseconds>,
+    Spi:
+        FullDuplex<u8, Error = SpiError> + embedded_hal::blocking::spi::Write<u8, Error = SpiError>,
+    SpiError: Debug,
+    //+ embedded_hal::blocking::spi::WriteIter<u8, Error = SpiError>,
+    Delay: embedded_hal::blocking::delay::DelayMs<u16>,
 {
-    // We return a Socket of a different lifetime because we don’t actually
-    // enforce that the Socket value lasts as long as the references to self/spi
-    // since it doesn’t ever access them directly.
-    pub fn socket_new<'a, 'b>(
-        &'a mut self,
-        spi: &'a mut Spi,
-    ) -> Result<Socket<'b, CsPin, Spi>, Error<SpiError>> {
-        let mut socket_num = 255u8;
+    pub fn socket_new(&mut self) -> Result<Socket, Error<SpiError>> {
+        let mut socket = InvalidSocket::new();
 
         self.send_and_receive(
-            spi,
             NinaCommand::GetSocket,
             Params::none(),
-            Params::of(&mut [RecvParam::Byte(&mut socket_num)]),
+            Params::of(&mut [RecvParam::Socket(&mut socket)]),
         )?;
 
-        if socket_num == 255 {
-            return Err(Error::NoSocketAvailable);
-        }
-
-        Ok(Socket::new(socket_num))
+        Ok(socket.try_into().map_err(|_| Error::NoSocketAvailable)?)
     }
 
-    pub fn socket_status(
-        &mut self,
-        spi: &mut Spi,
-        socket: &Socket<CsPin, Spi>,
-    ) -> Result<SocketStatus, Error<SpiError>> {
+    pub fn socket_status(&mut self, socket: &Socket) -> Result<SocketStatus, Error<SpiError>> {
         let mut status: u8 = 255;
 
         self.send_and_receive(
-            spi,
             NinaCommand::GetClientStateTcp,
             Params::of(&mut [SendParam::Byte(socket.num())]),
             Params::of(&mut [RecvParam::Byte(&mut status)]),
@@ -64,10 +50,9 @@ where
         Ok(status.into())
     }
 
-    pub fn socket_open<'a>(
-        &'a mut self,
-        spi: &'a mut Spi,
-        socket: &Socket<CsPin, Spi>,
+    pub fn socket_open(
+        &mut self,
+        socket: &'_ Socket,
         protocol: Protocol,
         destination: Destination,
         port: u16,
@@ -76,7 +61,6 @@ where
 
         match destination {
             Destination::Ip(ip) => self.send_and_receive(
-                spi,
                 NinaCommand::StartClientTcp,
                 Params::of(&mut [
                     SendParam::Bytes(&mut ip.iter().cloned()),
@@ -87,7 +71,6 @@ where
                 Params::of(&mut [RecvParam::OptionalByte(&mut result)]),
             )?,
             Destination::Hostname(name) => self.send_and_receive(
-                spi,
                 NinaCommand::StartClientTcp,
                 Params::of(&mut [
                     SendParam::Bytes(&mut name.bytes()),
@@ -108,14 +91,13 @@ where
 
         // Wait 3 seconds for the connection.
         for _ in 0..300 {
-            last_status = self.socket_status(spi, &socket)?;
+            last_status = self.socket_status(&socket)?;
 
             if last_status == SocketStatus::Established {
                 return Ok(SocketStatus::Established);
             }
 
-            self.timer.start(10.ms());
-            nb::block!(self.timer.wait()).ok();
+            self.delay.delay_ms(10);
         }
 
         Err(Error::SocketConnectionFailed(last_status))
@@ -126,46 +108,70 @@ where
     // Calling "close" again on a closed socket is a no-op (as long as the chip
     // hasn’t given out the same number again, which is why we loop in here to
     // prevent code from running that might allocate a new socket).
-    pub fn socket_close(
-        &mut self,
-        spi: &mut Spi,
-        socket: &Socket<CsPin, Spi>,
-    ) -> Result<(), Error<SpiError>> {
+    pub fn socket_close(&mut self, socket: &Socket) -> Result<(), Error<SpiError>> {
         self.send_and_receive(
-            spi,
             NinaCommand::StopClientTcp,
             Params::of(&mut [SendParam::Byte(socket.num())]),
             Params::of(&mut [RecvParam::Ack]),
         )
     }
 
-    pub fn connect<'a>(
-        &'a mut self,
-        spi: &'a mut Spi,
+    pub fn connect(
+        &mut self,
         protocol: Protocol,
         destination: Destination,
         port: u16,
-    ) -> Result<
-        ConnectedSocket<'a, CsPin, BusyPin, Spi, SpiError, CountDown, CountDownTime>,
-        Error<SpiError>,
-    > {
-        let socket = self.socket_new(spi)?;
+    ) -> Result<ConnectedSocket<'_, CsPin, BusyPin, Spi, SpiError, Delay>, Error<SpiError>> {
+        let socket = self.socket_new()?;
 
-        self.socket_open(spi, &socket, protocol, destination, port)?;
+        self.socket_open(&socket, protocol, destination, port)?;
 
-        Ok(ConnectedSocket::new(spi, self, socket))
+        Ok(ConnectedSocket::new(self, socket))
+    }
+
+    pub fn server(&mut self, protocol: Protocol, port: u16) -> Result<Socket, Error<SpiError>> {
+        let server_socket = self.socket_new()?;
+        let mut result: Option<u8> = None;
+        self.send_and_receive(
+            NinaCommand::StartServerTcp,
+            Params::of(&mut [
+                SendParam::Word(port),
+                SendParam::Byte(server_socket.num()),
+                SendParam::Byte(protocol.into()),
+            ]),
+            Params::of(&mut [RecvParam::OptionalByte(&mut result)]),
+        )?;
+
+        Ok(server_socket)
+    }
+
+    pub fn select_available(
+        &mut self,
+        server_socket: &Socket,
+    ) -> Result<ConnectedSocket<'_, CsPin, BusyPin, Spi, SpiError, Delay>, Error<SpiError>> {
+        let mut client_socket: u16 = 0;
+
+        self.send_and_receive(
+            NinaCommand::AvailableDataTcp,
+            Params::of(&mut [SendParam::Byte(server_socket.num())]),
+            Params::of(&mut [RecvParam::LEWord(&mut client_socket)]),
+        )?;
+
+        let socket: Socket = InvalidSocket::from(client_socket as u8)
+            .try_into()
+            .map_err(|_| Error::NoSocketAvailable)?;
+
+        Ok(ConnectedSocket::new(self, Socket::new(client_socket as u8)))
     }
 
     pub fn socket_write(
         &mut self,
-        spi: &mut Spi,
-        socket: &Socket<CsPin, Spi>,
+        socket: &Socket,
         bytes: &mut dyn ExactSizeIterator<Item = u8>,
     ) -> Result<usize, Error<SpiError>> {
         let mut written = 0u16;
 
         self.send_and_receive(
-            spi,
             NinaCommand::SendDataTcp,
             Params::with_16_bit_length(&mut [
                 SendParam::Byte(socket.num()),
@@ -180,14 +186,12 @@ where
 
     pub fn socket_read(
         &mut self,
-        spi: &mut Spi,
-        socket: &Socket<CsPin, Spi>,
+        socket: &Socket,
         buf: &mut [u8],
     ) -> Result<usize, nb::Error<Error<SpiError>>> {
         let mut available: u16 = 0;
 
         self.send_and_receive(
-            spi,
             NinaCommand::AvailableDataTcp,
             Params::of(&mut [SendParam::Byte(socket.num())]),
             Params::of(&mut [RecvParam::LEWord(&mut available)]),
@@ -195,7 +199,7 @@ where
         .map_err(|err| nb::Error::Other(err))?;
 
         if available == 0 {
-            return match self.socket_status(spi, socket)? {
+            return match self.socket_status(socket)? {
                 SocketStatus::Closed => Ok(0),
                 _ => Err(nb::Error::WouldBlock),
             };
@@ -206,7 +210,6 @@ where
         let mut read: usize = 0;
 
         self.send_and_receive(
-            spi,
             NinaCommand::GetDatabufTcp,
             Params::with_16_bit_length(&mut [
                 SendParam::Byte(socket.num()),
@@ -227,19 +230,50 @@ where
 //
 // These are refs because the docs for PhantomData say to use refs when there’s
 // not ownership.
-pub struct Socket<'a, CS, S> {
-    cs: core::marker::PhantomData<&'a CS>,
-    spi: core::marker::PhantomData<&'a S>,
+
+pub struct InvalidSocket {
     num: u8,
 }
 
-impl<'a, CS, S> Socket<'a, CS, S> {
-    pub fn new(num: u8) -> Self {
-        Socket {
-            cs: core::marker::PhantomData,
-            spi: core::marker::PhantomData,
-            num,
+impl InvalidSocket {
+    const INVALID: u8 = 255;
+    pub(crate) fn new() -> Self {
+        InvalidSocket { num: Self::INVALID }
+    }
+
+    pub fn num_mut(&mut self) -> &mut u8 {
+        &mut self.num
+    }
+
+    pub fn valid(num: u8) -> bool {
+        num != Self::INVALID
+    }
+}
+
+impl TryInto<Socket> for InvalidSocket {
+    type Error = ();
+    fn try_into(self) -> Result<Socket, Self::Error> {
+        if Self::valid(self.num) {
+            Ok(Socket::new(self.num))
+        } else {
+            Err(())
         }
+    }
+}
+
+impl From<u8> for InvalidSocket {
+    fn from(num: u8) -> Self {
+        InvalidSocket { num }
+    }
+}
+
+pub struct Socket {
+    num: u8,
+}
+
+impl Socket {
+    pub fn new(num: u8) -> Self {
+        Socket { num }
     }
 
     pub fn num(&self) -> u8 {
@@ -247,7 +281,7 @@ impl<'a, CS, S> Socket<'a, CS, S> {
     }
 }
 
-impl<'a, CS, S> core::fmt::Debug for Socket<'a, CS, S> {
+impl core::fmt::Debug for Socket {
     fn fmt(
         &self,
         fmt: &mut core::fmt::Formatter<'_>,
@@ -272,6 +306,23 @@ impl Into<u8> for Protocol {
 pub enum Destination<'a> {
     Ip([u8; 4]),
     Hostname(&'a str),
+}
+
+impl<'a> Display for Destination<'a> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Destination::Ip(arr) => {
+                let mut buf = [0u8; 4];
+
+                for part in arr {
+                    f.write_str(part.numtoa_str(10, &mut buf))?;
+                    f.write_char('.'); // yeah, I know
+                }
+                Ok(())
+            }
+            Destination::Hostname(h) => f.write_str(h),
+        }
+    }
 }
 
 #[repr(u8)]
@@ -312,73 +363,64 @@ impl From<u8> for SocketStatus {
     }
 }
 
-pub struct ConnectedSocket<'a, CS, B, S, SE, T, TC>
+pub struct ConnectedSocket<'a, CS, B, S, SE, D>
 where
     CS: OutputPin,
     B: InputPin,
-    S: FullDuplex<u8, Error = SE>
-        + embedded_hal::blocking::spi::Write<u8, Error = SE>
-        + embedded_hal::blocking::spi::WriteIter<u8, Error = SE>,
-    T: CountDown<Time = TC>,
-    TC: From<Milliseconds>,
+    S: FullDuplex<u8, Error = SE> + embedded_hal::blocking::spi::Write<u8, Error = SE>,
+    SE: Debug,
+    D: embedded_hal::blocking::delay::DelayMs<u16>,
 {
-    spi: &'a mut S,
-    wifi: &'a mut WifiNina<CS, B, S, T>,
-    socket: Socket<'a, CS, S>,
+    wifi: &'a mut WifiNina<CS, B, S, D>,
+    socket: Socket,
 }
 
-impl<'a, CS, B, S, SE, T, TC> ConnectedSocket<'a, CS, B, S, SE, T, TC>
+impl<'a, CS, B, S, SE, D> ConnectedSocket<'a, CS, B, S, SE, D>
 where
     CS: OutputPin,
     B: InputPin,
-    S: FullDuplex<u8, Error = SE>
-        + embedded_hal::blocking::spi::Write<u8, Error = SE>
-        + embedded_hal::blocking::spi::WriteIter<u8, Error = SE>,
-    T: CountDown<Time = TC>,
-    TC: From<Milliseconds>,
+    S: FullDuplex<u8, Error = SE> + embedded_hal::blocking::spi::Write<u8, Error = SE>,
+    SE: Debug,
+    D: embedded_hal::blocking::delay::DelayMs<u16>,
 {
-    pub fn new(
-        spi: &'a mut S,
-        wifi: &'a mut WifiNina<CS, B, S, T>,
-        socket: Socket<'a, CS, S>,
-    ) -> Self {
-        ConnectedSocket { spi, wifi, socket }
+    pub fn new(wifi: &'a mut WifiNina<CS, B, S, D>, socket: Socket) -> Self {
+        ConnectedSocket { wifi, socket }
     }
 
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, nb::Error<Error<SE>>> {
-        self.wifi.socket_read(self.spi, &self.socket, buf)
+        self.wifi.socket_read(&self.socket, buf)
     }
 
     pub fn write(&mut self, buf: &[u8]) -> Result<usize, Error<SE>> {
         self.wifi
-            .socket_write(self.spi, &self.socket, &mut buf.iter().cloned())
+            .socket_write(&self.socket, &mut buf.iter().cloned())
+    }
+
+    pub fn socket(&self) -> &Socket {
+        &self.socket
     }
 }
 
-impl<'a, CS, B, S, SE, T, TC> Drop for ConnectedSocket<'a, CS, B, S, SE, T, TC>
+impl<'a, CS, B, S, SE, D> Drop for ConnectedSocket<'a, CS, B, S, SE, D>
 where
     CS: OutputPin,
     B: InputPin,
-    S: FullDuplex<u8, Error = SE>
-        + embedded_hal::blocking::spi::Write<u8, Error = SE>
-        + embedded_hal::blocking::spi::WriteIter<u8, Error = SE>,
-    T: CountDown<Time = TC>,
-    TC: From<Milliseconds>,
+    S: FullDuplex<u8, Error = SE> + embedded_hal::blocking::spi::Write<u8, Error = SE>,
+    SE: Debug,
+    D: embedded_hal::blocking::delay::DelayMs<u16>,
 {
     fn drop(&mut self) {
-        self.wifi.socket_close(self.spi, &self.socket).ok();
+        self.wifi.socket_close(&self.socket).ok();
     }
 }
 
-impl<'a, CS, B, S, SE, T, TC> core::fmt::Write for ConnectedSocket<'a, CS, B, S, SE, T, TC>
+impl<'a, CS, B, S, SE, D> core::fmt::Write for ConnectedSocket<'a, CS, B, S, SE, D>
 where
     CS: OutputPin,
     B: InputPin,
-    S: FullDuplex<u8, Error = SE>
-        + embedded_hal::blocking::spi::Write<u8, Error = SE>
-        + embedded_hal::blocking::spi::WriteIter<u8, Error = SE>,
-    T: CountDown<Time = TC>,
-    TC: From<Milliseconds>,
+    S: FullDuplex<u8, Error = SE> + embedded_hal::blocking::spi::Write<u8, Error = SE>,
+    SE: Debug,
+    D: embedded_hal::blocking::delay::DelayMs<u16>,
 {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         match self.write(s.as_bytes()) {
@@ -389,15 +431,13 @@ where
 }
 
 #[cfg(feature = "genio-traits")]
-impl<'a, CS, B, S, SE, T, TC> genio::Read for ConnectedSocket<'a, CS, B, S, SE, T, TC>
+impl<'a, CS, B, S, SE, D> genio::Read for ConnectedSocket<'a, CS, B, S, SE, D>
 where
     CS: OutputPin,
     B: InputPin,
-    S: FullDuplex<u8, Error = SE>
-        + embedded_hal::blocking::spi::Write<u8, Error = SE>
-        + embedded_hal::blocking::spi::WriteIter<u8, Error = SE>,
-    T: CountDown<Time = TC>,
-    TC: From<Milliseconds>,
+    S: FullDuplex<u8, Error = SE> + embedded_hal::blocking::spi::Write<u8, Error = SE>,
+    SE: Debug,
+    D: embedded_hal::blocking::delay::DelayMs<u16>,
 {
     type ReadError = nb::Error<Error<SE>>;
 
@@ -407,15 +447,13 @@ where
 }
 
 #[cfg(feature = "genio-traits")]
-impl<'a, CS, B, S, SE, T, TC> genio::Write for ConnectedSocket<'a, CS, B, S, SE, T, TC>
+impl<'a, CS, B, S, SE, D> genio::Write for ConnectedSocket<'a, CS, B, S, SE, D>
 where
     CS: OutputPin,
     B: InputPin,
-    S: FullDuplex<u8, Error = SE>
-        + embedded_hal::blocking::spi::Write<u8, Error = SE>
-        + embedded_hal::blocking::spi::WriteIter<u8, Error = SE>,
-    T: CountDown<Time = TC>,
-    TC: From<Milliseconds>,
+    S: FullDuplex<u8, Error = SE> + embedded_hal::blocking::spi::Write<u8, Error = SE>,
+    SE: Debug,
+    D: embedded_hal::blocking::delay::DelayMs<u16>,
 {
     type WriteError = Error<SE>;
     type FlushError = void::Void;

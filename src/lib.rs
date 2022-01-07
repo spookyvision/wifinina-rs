@@ -1,41 +1,37 @@
 #![no_std]
 
 mod chip_select;
-mod util;
 pub mod commands;
+pub mod util;
 
-use embedded_hal::digital::v2::{InputPin, OutputPin};
-use embedded_hal::spi::FullDuplex;
-
-use nb::block;
-
-use util::millis::{Milliseconds, U32Ext};
+use core::fmt::Debug;
 
 use chip_select::*;
+use commands::{socket::SocketStatus, wifi::WifiStatus};
+use embedded_hal::{
+    digital::v2::{InputPin, OutputPin},
+    spi::FullDuplex,
+};
 
-use commands::{socket::SocketStatus, wifi::WifiStatus,};
-
-
-pub struct WifiNina<CsPin, BusyPin, Spi, CountDown>
+pub struct WifiNina<CsPin, BusyPin, Spi, Delay>
 where
     CsPin: OutputPin,
     BusyPin: InputPin,
+    Delay: embedded_hal::blocking::delay::DelayMs<u16>,
 {
-    spi: core::marker::PhantomData<Spi>,
+    spi: Spi,
     chip_select: WifiNinaChipSelect<Spi, CsPin, BusyPin>,
-    timer: CountDown,
+    delay: Delay,
 }
 
-impl<CsPin, BusyPin, Spi, SpiError, CountDown, CountDownTime>
-    WifiNina<CsPin, BusyPin, Spi, CountDown>
+impl<CsPin, BusyPin, Spi, SpiError, Delay> WifiNina<CsPin, BusyPin, Spi, Delay>
 where
     BusyPin: InputPin,
     CsPin: OutputPin,
-    Spi: FullDuplex<u8, Error = SpiError>
-        + embedded_hal::blocking::spi::Write<u8, Error = SpiError>
-        + embedded_hal::blocking::spi::WriteIter<u8, Error = SpiError>,
-    CountDown: embedded_hal::timer::CountDown<Time = CountDownTime>,
-    CountDownTime: From<Milliseconds>,
+    Spi:
+        FullDuplex<u8, Error = SpiError> + embedded_hal::blocking::spi::Write<u8, Error = SpiError>,
+    SpiError: Debug,
+    Delay: embedded_hal::blocking::delay::DelayMs<u16>, //+ embedded_hal::blocking::spi::WriteIter<u8, Error = SpiError>,
 {
     // const ConnectionDelayMs: u16 = 100;
 
@@ -43,20 +39,20 @@ where
     //
     // Also resets the WifiNINA chip.
     pub fn new<ResetPin>(
-        _spi: &Spi,
+        spi: Spi,
         cs: CsPin,
         busy: BusyPin,
         reset: &mut ResetPin,
-        timer: CountDown,
+        delay: Delay,
     ) -> Result<Self, Error<SpiError>>
     where
         ResetPin: OutputPin,
     {
         let mut wifi = WifiNina {
-            spi: core::marker::PhantomData,
+            spi,
             chip_select: WifiNinaChipSelect::new(cs, busy)
                 .map_err(|_| Error::ChipSelectPinError)?,
-            timer,
+            delay,
         };
 
         wifi.reset(reset)?;
@@ -70,13 +66,11 @@ where
     {
         reset.set_low().map_err(|_| Error::ResetPinError)?;
 
-        self.timer.start(200.ms());
-        block!(self.timer.wait()).unwrap();
+        self.delay.delay_ms(250);
 
         reset.set_high().map_err(|_| Error::ResetPinError)?;
 
-        self.timer.start(750.ms());
-        block!(self.timer.wait()).unwrap();
+        self.delay.delay_ms(750);
 
         Ok(())
     }
@@ -85,7 +79,7 @@ where
 }
 
 #[derive(Debug)]
-pub enum Error<SpiError> {
+pub enum Error<SpiError: Debug> {
     ChipSelectPinError,
     ChipSelectTimeout,
 
@@ -108,7 +102,10 @@ pub enum Error<SpiError> {
     ResetPinError,
 }
 
-impl<SpiError> Error<SpiError> {
+impl<SpiError> Error<SpiError>
+where
+    SpiError: Debug,
+{
     // Convenience function for passing to map_err, because we can’t use
     // the From trait because SpiError is fully parameterized.
     fn spi(err: SpiError) -> Error<SpiError> {
@@ -116,7 +113,10 @@ impl<SpiError> Error<SpiError> {
     }
 }
 
-impl<BE, CE, SE> From<WifiNinaChipSelectError<BE, CE>> for Error<SE> {
+impl<BE, CE, SE> From<WifiNinaChipSelectError<BE, CE>> for Error<SE>
+where
+    SE: Debug,
+{
     fn from(err: WifiNinaChipSelectError<BE, CE>) -> Self {
         match err {
             WifiNinaChipSelectError::BusyPinError(_) => Error::ChipSelectPinError,
